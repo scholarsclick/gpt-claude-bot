@@ -1,0 +1,93 @@
+# =============================================================================
+# BTC/ETH 5-minute Polymarket Up/Down prediction bot — configuration
+# =============================================================================
+# All thresholds here are intentionally conservative. The bot is designed to
+# SKIP the large majority of markets and only trade when several independent
+# signals agree AND the market is mispriced relative to the model.
+# =============================================================================
+
+mode: paper            # backtest | paper | live  (live also requires LIVE_TRADING=true in .env)
+
+assets:
+  - symbol: BTC
+    exchange_symbol: BTC/USDT
+  - symbol: ETH
+    exchange_symbol: ETH/USDT
+
+exchange:
+  name: binance              # any ccxt-supported spot exchange
+  ohlcv_timeframe_fast: 1m
+  ohlcv_timeframe_base: 5m
+  ohlcv_timeframe_htf1: 15m
+  ohlcv_timeframe_htf2: 1h
+  orderbook_depth: 50
+  rate_limit_ms: 250
+
+polymarket:
+  clob_base_url: https://clob.polymarket.com
+  gamma_base_url: https://gamma-api.polymarket.com
+  # Tags / slugs used to discover 5-minute up/down crypto markets.
+  market_keywords: ["up or down", "5 minute", "5-minute", "5m"]
+  poll_interval_seconds: 5
+
+# --- Confidence / edge gates -------------------------------------------------
+gates:
+  min_probability: 0.58          # model prob for the chosen side must exceed this
+  min_ev_after_fees: 0.03        # minimum expected value (fraction of stake) after costs
+  min_seconds_remaining: 45      # skip late entries unless strong edge (see strong_edge)
+  strong_edge_probability: 0.66  # allows late / borderline entries
+  max_spread_bps: 150            # skip if Polymarket YES/NO spread too wide (basis points)
+  max_distance_to_target_bps: 8  # near expiry, skip if price hugs target (coin-flip) ...
+  near_expiry_seconds: 60        # ... when this much time or less remains
+  block_news_volatility: true    # skip when abnormal volatility detected
+  abnormal_vol_zscore: 3.0       # realized-vol z-score that counts as "abnormal"
+
+# --- Cost model --------------------------------------------------------------
+costs:
+  taker_fee: 0.0                 # Polymarket has no maker/taker fee on trades currently
+  slippage_bps: 100              # assumed slippage in basis points of price
+  safety_buffer_ev: 0.01         # extra EV cushion subtracted before trading
+
+# --- Signal engine weights (rule-based score) --------------------------------
+# Each component returns a score in [-1, 1]; the weighted sum is squashed to a
+# directional probability. Weights need not sum to 1 (they are normalised).
+weights:
+  market_structure: 0.30
+  momentum: 0.30
+  volatility: 0.15
+  microstructure: 0.25
+
+# --- Model ensemble ----------------------------------------------------------
+model:
+  enabled: true
+  type: lightgbm                 # lightgbm | logistic | rules_only
+  model_path: artifacts/model.txt
+  calibrator_path: artifacts/calibrator.pkl
+  # Blend of rule score vs ML model when both available (must sum to 1.0)
+  blend_rules: 0.4
+  blend_ml: 0.6
+  min_training_rows: 2000        # below this, fall back to rules_only
+
+# --- Risk management ---------------------------------------------------------
+risk:
+  stake_per_trade: 5.0           # fixed USDC stake per trade
+  daily_max_loss: 50.0           # stop trading for the day after this loss
+  max_consecutive_losses: 4
+  max_drawdown: 100.0            # halt trading when equity drawdown exceeds this
+  max_open_trades_per_asset: 1
+  starting_bankroll: 1000.0
+
+# --- Backtest ----------------------------------------------------------------
+backtest:
+  data_dir: data
+  window_seconds: 300            # 5-minute Polymarket windows
+  entry_offsets_seconds: [120, 60, 30]  # simulate entering at these times-remaining
+  implied_prob_noise: 0.02       # synthetic market mispricing noise for EV simulation
+  fee_model_from_costs: true
+
+database:
+  path: artifacts/trades.db
+
+logging:
+  level: INFO
+  file: artifacts/bot.log
