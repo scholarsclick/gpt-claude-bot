@@ -54,63 +54,100 @@ tab_live, tab_trades, tab_backtest = st.tabs(["🔴 Live Signals", "📒 Trades 
 
 # --------------------------------------------------------------------------- #
 with tab_live:
-    if st.button("🔄 Refresh markets"):
+    import time as _time
+    c_a, c_b = st.columns([1, 3])
+    if c_a.button("🔄 Refresh now"):
         st.cache_data.clear()
+    auto = c_b.checkbox("Auto-refresh every 10s", value=False)
 
     @st.cache_data(ttl=8)
     def live_signals():
-        rows = []
+        """Always compute a per-asset Binance + model signal for the current 5m
+        window. Attach Polymarket odds/EV when a matching market is found."""
+        rows, diag = [], []
+        # discover Polymarket markets (best-effort; signals still render without them)
+        markets_by_asset = {}
         try:
-            markets = poly.find_active_markets()
+            for m in poly.find_active_markets():
+                markets_by_asset.setdefault(m.asset, []).append(m)
+            diag.append(f"Polymarket markets found: "
+                        f"{ {k: len(v) for k, v in markets_by_asset.items()} }")
         except Exception as exc:
-            return [], f"Market discovery failed: {exc}"
-        for m in markets:
-            if m.asset not in [a["symbol"] for a in cfg["assets"]]:
-                continue
+            diag.append(f"Polymarket discovery error: {exc}")
+
+        now = _time.time()
+        sec_left = 300 - (now % 300)   # time remaining in the current 5m window
+
+        for a in cfg["assets"]:
+            asset, sym = a["symbol"], a["exchange_symbol"]
             try:
-                m = poly.refresh_prices(m)
-                sym = exchange_symbol_for(cfg, m.asset)
                 tf = fetcher.fetch_all_timeframes(sym)
                 if tf["1m"] is None or tf["5m"] is None:
+                    rows.append({"Asset": asset, "Signal": "NO DATA",
+                                 "Reason": f"Binance unreachable for {sym} "
+                                           "(geo-block/VPN/network)"})
                     continue
+                price = fetcher.current_price(sym) or float(tf["1m"]["close"].iloc[-1])
+                # current 5m window open = open of the last (forming) 5m candle
+                target = float(tf["5m"]["open"].iloc[-1])
                 ob = fetcher.fetch_orderbook(sym)
                 flow = fetcher.fetch_trade_flow(sym)
-                price = fetcher.current_price(sym) or float(tf["1m"]["close"].iloc[-1])
-                target = m.target_price or price
-                ctx = MarketContext(target_price=target, seconds_remaining=m.seconds_remaining,
-                                    yes_price=m.yes_price, no_price=m.no_price, candle_open=target)
+
+                # attach a Polymarket market for this asset, if any
+                mkt = None
+                for cand in markets_by_asset.get(asset, []):
+                    if cand.seconds_remaining > 0:
+                        mkt = poly.refresh_prices(cand)
+                        break
+                yes = mkt.yes_price if mkt else None
+                no = mkt.no_price if mkt else None
+                srem = mkt.seconds_remaining if mkt else sec_left
+
+                ctx = MarketContext(target_price=target, seconds_remaining=srem,
+                                    yes_price=yes, no_price=no, candle_open=target)
                 feats = build_features(tf, ctx, orderbook=ob, trade_flow=flow)
-                sig = engine.evaluate(m.asset, feats, ctx)
+                sig = engine.evaluate(asset, feats, ctx)
+                lean = "UP" if sig.probability_up >= 0.5 else "DOWN"
                 rows.append({
-                    "Asset": m.asset, "Question": m.question[:50],
-                    "Price": round(price, 2), "Target": round(target, 2),
+                    "Asset": asset,
+                    "Price": round(price, 2),
+                    "Window open": round(target, 2),
                     "Dist(bps)": round(feats.get("dist_from_target_bps", 0), 1),
-                    "Sec left": round(m.seconds_remaining),
-                    "Model P(up)": sig.probability_up,
-                    "PM odds(up)": m.yes_price,
-                    "EV": sig.expected_value,
+                    "Sec left": round(srem),
+                    "Model lean": lean,
+                    "P(up)": round(sig.probability_up, 3),
+                    "Conf": round(sig.confidence, 2),
+                    "PM odds(up)": round(yes, 3) if yes is not None else "—",
+                    "EV": round(sig.expected_value, 3) if yes is not None else "—",
                     "Signal": sig.side,
                     "Reason": sig.skip_reason or "; ".join(sig.reasons),
                 })
             except Exception as exc:
-                rows.append({"Asset": m.asset, "Question": m.question[:50], "Signal": "ERR",
-                             "Reason": str(exc)})
-        return rows, None
+                rows.append({"Asset": asset, "Signal": "ERR", "Reason": str(exc)})
+        return rows, diag
 
-    rows, err = live_signals()
-    if err:
-        st.warning(err)
-    if not rows:
-        st.info("No active BTC/ETH 5-minute markets found (or no network access). "
-                "Discovery depends on Polymarket having live 5m up/down markets right now.")
+    rows, diag = live_signals()
+    for d in diag:
+        st.caption(d)
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        st.info("No data. Check network access to Binance and Polymarket.")
     else:
-        df = pd.DataFrame(rows)
         def color_signal(v):
-            return {"UP": "background-color:#103d10", "DOWN": "background-color:#3d1010"}.get(v, "")
-        st.dataframe(df.style.applymap(color_signal, subset=["Signal"]),
-                     use_container_width=True, height=420)
-        traded = df[df["Signal"].isin(["UP", "DOWN"])]
-        st.metric("Actionable signals", f"{len(traded)} / {len(df)}")
+            return {"UP": "background-color:#103d10",
+                    "DOWN": "background-color:#3d1010"}.get(v, "")
+        sty = df.style.applymap(color_signal, subset=["Signal"]) if "Signal" in df else df.style
+        st.dataframe(sty, use_container_width=True)
+        if "Signal" in df:
+            traded = df[df["Signal"].isin(["UP", "DOWN"])]
+            st.metric("Actionable signals (UP/DOWN)", f"{len(traded)} / {len(df)}")
+        st.caption("Model lean / P(up) always reflect live Binance price action. "
+                   "Signal stays SKIP until Polymarket odds exist AND the EV edge "
+                   "clears fees + slippage — by design, most windows are SKIP.")
+    if auto:
+        _time.sleep(10)
+        st.rerun()
 
 # --------------------------------------------------------------------------- #
 with tab_trades:

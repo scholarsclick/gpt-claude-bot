@@ -108,20 +108,107 @@ class PolymarketClient:
                 time.sleep(wait)
         return None
 
-    def find_active_markets(self) -> List[PolyMarket]:
-        """Discover active short-dated BTC/ETH up/down markets via Gamma."""
+    # Polymarket's recurring crypto up/down markets use a *deterministic* slug:
+    #   {asset}-updown-{interval}-{window_ts}
+    # where window_ts = unix_now - (unix_now % interval_seconds). We build the
+    # slug for the current (and next) window directly instead of scanning every
+    # active market — keyword scanning does not surface these short-dated markets.
+    SLUG_PREFIX = {"BTC": "btc", "ETH": "eth"}
+
+    @staticmethod
+    def window_ts(interval_seconds: int = 300, ahead: int = 0) -> int:
+        now = int(time.time())
+        return now - (now % interval_seconds) + ahead * interval_seconds
+
+    def find_active_markets(self, interval_seconds: int = 300) -> List[PolyMarket]:
+        """Discover the current & next BTC/ETH 5-minute up/down markets by slug."""
+        interval = "5m" if interval_seconds == 300 else f"{interval_seconds // 60}m"
+        out: List[PolyMarket] = []
+        for asset, prefix in self.SLUG_PREFIX.items():
+            for ahead in (0, 1):  # current window + the one about to open
+                ts = self.window_ts(interval_seconds, ahead)
+                slug = f"{prefix}-updown-{interval}-{ts}"
+                pm = self._fetch_by_slug(slug, asset, ts, interval_seconds)
+                if pm is not None:
+                    out.append(pm)
+        if not out:
+            out = self._keyword_fallback()
+        log.info("Discovered %d active BTC/ETH up-down markets", len(out))
+        return out
+
+    def _fetch_by_slug(self, slug: str, asset: str, window_ts: int,
+                       interval_seconds: int) -> Optional[PolyMarket]:
+        # The event endpoint nests the tradable market(s) under "markets".
+        data = self._get(f"{self.gamma}/events", params={"slug": slug})
+        events = data if isinstance(data, list) else (data.get("data") if data else None)
+        if not events:
+            # some deployments expose the slug directly on /markets
+            mdata = self._get(f"{self.gamma}/markets", params={"slug": slug})
+            mkts = mdata if isinstance(mdata, list) else (mdata.get("data") if mdata else None)
+            if not mkts:
+                return None
+            return self._build_market(mkts[0], asset, slug, window_ts, interval_seconds,
+                                      title=mkts[0].get("question"))
+        ev = events[0]
+        markets = ev.get("markets") or []
+        if not markets:
+            return None
+        return self._build_market(markets[0], asset, slug, window_ts, interval_seconds,
+                                   title=ev.get("title") or markets[0].get("question"))
+
+    def _build_market(self, m: dict, asset: str, slug: str, window_ts: int,
+                      interval_seconds: int, title: Optional[str]) -> PolyMarket:
+        yes_id, no_id = self._token_ids(m)
+        yes_price, no_price = self._outcome_prices(m)
+        end_time = (_parse_dt(m.get("endDate") or m.get("end_date_iso"))
+                    or datetime.fromtimestamp(window_ts + interval_seconds, tz=timezone.utc))
+        return PolyMarket(
+            market_id=slug,
+            question=(title or f"{asset} Up or Down").strip(),
+            asset=asset,
+            target_price=None,            # resolves vs window-open oracle price; bot uses candle open
+            end_time=end_time,
+            yes_token_id=yes_id, no_token_id=no_id,
+            yes_price=yes_price, no_price=no_price, raw=m,
+        )
+
+    @staticmethod
+    def _token_ids(m: dict):
+        token_ids = m.get("clobTokenIds") or m.get("clob_token_ids")
+        if isinstance(token_ids, str):
+            try:
+                token_ids = json.loads(token_ids)
+            except json.JSONDecodeError:
+                token_ids = None
+        if isinstance(token_ids, list) and len(token_ids) >= 2:
+            return str(token_ids[0]), str(token_ids[1])
+        return None, None
+
+    @staticmethod
+    def _outcome_prices(m: dict):
+        prices = m.get("outcomePrices") or m.get("outcome_prices")
+        if isinstance(prices, str):
+            try:
+                prices = json.loads(prices)
+            except json.JSONDecodeError:
+                prices = None
+        if isinstance(prices, list) and len(prices) >= 2:
+            try:
+                return float(prices[0]), float(prices[1])
+            except (TypeError, ValueError):
+                return None, None
+        return None, None
+
+    def _keyword_fallback(self) -> List[PolyMarket]:
+        """Last-resort scan of active markets by keyword (older market styles)."""
         data = self._get(f"{self.gamma}/markets",
                          params={"active": "true", "closed": "false", "limit": 500})
-        if not data:
-            return []
-        markets = data if isinstance(data, list) else data.get("data", data.get("markets", []))
+        markets = data if isinstance(data, list) else (data.get("data", []) if data else [])
         out: List[PolyMarket] = []
-        for m in markets:
+        for m in markets or []:
             q = (m.get("question") or m.get("title") or "").strip()
             ql = q.lower()
-            if not q:
-                continue
-            if not any(k in ql for k in self.keywords):
+            if not q or not any(k in ql for k in self.keywords):
                 continue
             asset = _parse_asset(q)
             if asset is None:
@@ -129,7 +216,6 @@ class PolymarketClient:
             pm = self._parse_market(m, q, asset)
             if pm is not None:
                 out.append(pm)
-        log.info("Discovered %d candidate BTC/ETH up-down markets", len(out))
         return out
 
     def _parse_market(self, m: dict, q: str, asset: str) -> Optional[PolyMarket]:

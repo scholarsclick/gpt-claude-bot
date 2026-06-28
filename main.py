@@ -215,7 +215,10 @@ class TradingLoop:
         ob = self.fetcher.fetch_orderbook(sym)
         flow = self.fetcher.fetch_trade_flow(sym)
         price = self.fetcher.current_price(sym) or float(tf["1m"]["close"].iloc[-1])
-        target = market.target_price if market.target_price else price
+        # 5m up/down markets resolve vs the price at the window open. Use the
+        # open of the current (forming) 5m candle as the target when the market
+        # carries no explicit strike (the deterministic-slug markets don't).
+        target = market.target_price if market.target_price else float(tf["5m"]["open"].iloc[-1])
         ctx = MarketContext(
             target_price=target,
             seconds_remaining=market.seconds_remaining,
@@ -224,7 +227,7 @@ class TradingLoop:
         )
         feats = build_features(tf, ctx, orderbook=ob, trade_flow=flow)
         sig = self.engine.evaluate(market.asset, feats, ctx)
-        return sig, price
+        return sig, price, target
 
     def _resolve_expired(self):
         for mid in list(self.open_trades.keys()):
@@ -251,7 +254,7 @@ class TradingLoop:
             result = self._evaluate_market(m)
             if result is None:
                 continue
-            sig, price = result
+            sig, price, target = result
             tag = (f"{m.asset} {m.seconds_remaining:.0f}s left | {sig.side} "
                    f"p_up={sig.probability_up:.2f} EV={sig.expected_value:+.1%}")
             if sig.side == "SKIP":
@@ -262,7 +265,7 @@ class TradingLoop:
                 log.info("BLOCK %s | risk: %s", tag, rs.reason)
                 continue
             log.info("TRADE %s | %s", tag, "; ".join(sig.reasons))
-            tid = self.risk.open_trade(self.mode, m.asset, m.market_id, sig, m.target_price or price)
+            tid = self.risk.open_trade(self.mode, m.asset, m.market_id, sig, target)
             if self.mode == "live":
                 token = m.yes_token_id if sig.side == "UP" else m.no_token_id
                 size = self.risk.stake / (sig.entry_price or 0.5)
