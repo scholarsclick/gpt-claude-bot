@@ -137,8 +137,17 @@ with tab_live:
         def color_signal(v):
             return {"UP": "background-color:#103d10",
                     "DOWN": "background-color:#3d1010"}.get(v, "")
-        sty = df.style.applymap(color_signal, subset=["Signal"]) if "Signal" in df else df.style
-        st.dataframe(sty, use_container_width=True)
+        try:
+            if "Signal" in df:
+                styler = df.style
+                # pandas >=2.1 renamed Styler.applymap -> Styler.map
+                cell_style = getattr(styler, "map", None) or styler.applymap
+                styler = cell_style(color_signal, subset=["Signal"])
+                st.dataframe(styler, use_container_width=True)
+            else:
+                st.dataframe(df, use_container_width=True)
+        except Exception:
+            st.dataframe(df, use_container_width=True)   # styling is cosmetic only
         if "Signal" in df:
             traded = df[df["Signal"].isin(["UP", "DOWN"])]
             st.metric("Actionable signals (UP/DOWN)", f"{len(traded)} / {len(df)}")
